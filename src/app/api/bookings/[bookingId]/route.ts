@@ -515,6 +515,7 @@ export async function DELETE(_request: Request, context: RouteContext) {
       booking.time,
       booking.duration || 60,
       booking.seatId,
+      booking.timeZone,
     ).catch((err) => {
       console.error("[Booking Cancellation] Waitlist notification failed:", err);
     });
