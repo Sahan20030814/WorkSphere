@@ -155,12 +155,22 @@ export class ConsensusProtocol {
             return false;
         }
 
-        // Rule 2: If term >= currentTerm, acknowledge valid leader and reset timeout
-        if (term > this.state.currentTerm || this.state.role !== 'follower' || this.state.leaderId !== leaderId) {
+        // Rule 2: A newer term starts a fresh election epoch, so (and only then)
+        // the vote cast in the previous term is forgotten. Within the same term
+        // votedFor MUST be kept: clearing it would let this node vote for a
+        // second candidate in the same term and elect two leaders.
+        if (term > this.state.currentTerm) {
             this.state.currentTerm = term;
+            this.state.votedFor = null;
+        }
+
+        // Rule 3: Acknowledge the valid leader and fall back to follower
+        // (a same-term candidate/leader yields to the leader it just heard from).
+        if (this.state.role !== 'follower' || this.state.leaderId !== leaderId) {
             this.state.leaderId = leaderId;
             this.state.role = 'follower';
-            this.state.votedFor = null;
+            this.votesReceived.clear();
+            this.heartbeatAcks.clear();
             this.clearHeartbeats();
         }
 
@@ -225,9 +235,12 @@ export class ConsensusProtocol {
     public stepDown(newTerm?: number): void {
         if (newTerm !== undefined && newTerm > this.state.currentTerm) {
             this.state.currentTerm = newTerm;
+            // Raft: a node casts at most one vote per term. The previous vote is
+            // only discarded when the term advances; stepping down within the
+            // same term (e.g. a leader that lost its quorum lease) must keep it.
+            this.state.votedFor = null;
         }
         this.state.role = 'follower';
-        this.state.votedFor = null;
         this.state.leaderId = null;
         this.votesReceived.clear();
         this.heartbeatAcks.clear();
