@@ -20,6 +20,12 @@ export interface SyncQueueItem<T = unknown> {
   attempts: number;
   maxRetries: number;
   nextAttemptAt: number;
+  /**
+   * Newer payload enqueued under the same id while this item was being
+   * processed. It is applied (latest wins) as soon as the in-flight attempt
+   * settles, so a late edit is never dropped.
+   */
+  pendingPayload?: { payload: T };
   lastError?: string;
   failureReason?:
     | "unrecoverable_client_error"
@@ -143,31 +149,91 @@ export function calculateBackoff(
 }
 
 /**
+ * Deterministic, order-independent serialization of arbitrary payloads.
+ *
+ * Unlike `JSON.stringify(obj, Object.keys(obj).sort())`, whose array replacer
+ * acts as an allow-list for EVERY nesting level (silently dropping any nested
+ * property whose name is not also a top-level key), this walks the whole value
+ * and sorts keys at each level, so payloads that differ only in nested data
+ * always serialize differently.
+ */
+function canonicalize(value: unknown, ancestors: unknown[] = []): string {
+  if (value === undefined) return "undefined";
+  if (value === null) return "null";
+
+  switch (typeof value) {
+    case "string":
+      return JSON.stringify(value);
+    case "number":
+    case "boolean":
+      return String(value);
+    case "bigint":
+      return `${value}n`;
+    case "function":
+    case "symbol":
+      return "undefined";
+  }
+
+  const obj = value as object;
+  if (ancestors.includes(obj)) {
+    throw new TypeError("Cannot canonicalize circular payload");
+  }
+  const nextAncestors = [...ancestors, obj];
+
+  const withToJson = obj as { toJSON?: () => unknown };
+  if (typeof withToJson.toJSON === "function") {
+    return canonicalize(withToJson.toJSON(), nextAncestors);
+  }
+
+  if (Array.isArray(obj)) {
+    return `[${obj
+      .map((item) => {
+        const text = canonicalize(item, nextAncestors);
+        return text === "undefined" ? "null" : text;
+      })
+      .join(",")}]`;
+  }
+
+  const record = obj as Record<string, unknown>;
+  const entries: string[] = [];
+  for (const key of Object.keys(record).sort()) {
+    const text = canonicalize(record[key], nextAncestors);
+    if (text === "undefined") continue;
+    entries.push(`${JSON.stringify(key)}:${text}`);
+  }
+  return `{${entries.join(",")}}`;
+}
+
+/** 53-bit string hash (cyrb53) - far lower collision odds than a 32-bit hash. */
+function cyrb53(str: string, seed = 0): number {
+  let h1 = 0xdeadbeef ^ seed;
+  let h2 = 0x41c6ce57 ^ seed;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+
+/**
  * Generates a deterministic idempotency key for queued offline actions
  * based on entity type and payload content.
+ *
+ * Two payloads get the same key only when their full (deeply nested,
+ * key-order-independent) content is identical, because a key collision makes
+ * the queue drop the second mutation as a "duplicate".
  */
 export function generateIdempotencyKey<T = unknown>(type: string, payload: T): string {
   try {
-    const payloadStr =
-      typeof payload === "string"
-        ? payload
-        : payload === null || payload === undefined
-          ? ""
-          : typeof payload === "object"
-            ? JSON.stringify(payload, Object.keys(payload).sort())
-            : String(payload);
-
-    let hash = 0;
-    const str = `${type}:${payloadStr}`;
-    for (let i = 0; i < str.length; i++) {
-      const char = str.charCodeAt(i);
-      hash = (hash << 5) - hash + char;
-      hash |= 0;
-    }
-    const hexHash = Math.abs(hash).toString(36);
-    return `sync_${type}_${hexHash}`;
+    const str = `${type}:${canonicalize(payload)}`;
+    // Two independently seeded 53-bit hashes (~106 bits) plus the length.
+    const hash = `${cyrb53(str, 0).toString(36)}${cyrb53(str, 1).toString(36)}${str.length.toString(36)}`;
+    return `sync_${type}_${hash}`;
   } catch {
-    return `sync_${type}_${Date.now()}`;
+    return `sync_${type}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
   }
 }
 
@@ -213,6 +279,26 @@ export class OfflineSyncQueueManager {
         existing.status === "processing" ||
         existing.status === "retry")
     ) {
+      // Same id, same content: a true duplicate.
+      if (this.hasSamePayload(existing.payload, payload)) {
+        return existing as SyncQueueItem<T>;
+      }
+
+      // Same id, NEW content (e.g. a second offline edit of the same entity).
+      // Latest wins - returning the existing item would silently discard it.
+      if (existing.status === "processing") {
+        // An attempt with the old payload is in flight; apply once it settles.
+        existing.pendingPayload = { payload };
+      } else {
+        existing.payload = payload;
+        existing.status = "pending";
+        existing.attempts = 0;
+        existing.nextAttemptAt = now;
+        existing.lastError = undefined;
+        existing.failureReason = undefined;
+      }
+      existing.updatedAt = now;
+      this.emitEvent("queue:progress", existing);
       return existing as SyncQueueItem<T>;
     }
 
@@ -231,6 +317,15 @@ export class OfflineSyncQueueManager {
     this.items.set(id, item as SyncQueueItem);
     this.emitEvent("queue:progress", item as SyncQueueItem);
     return item;
+  }
+
+  private hasSamePayload(a: unknown, b: unknown): boolean {
+    if (a === b) return true;
+    try {
+      return canonicalize(a) === canonicalize(b);
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -520,6 +615,20 @@ export class OfflineSyncQueueManager {
           err instanceof Error ? err : new Error(errorMsg),
         );
       }
+    }
+
+    // A newer payload arrived for this id while the attempt was in flight.
+    // Whatever the outcome of the old attempt, the latest payload must be sent.
+    if (item.pendingPayload) {
+      item.payload = item.pendingPayload.payload;
+      item.pendingPayload = undefined;
+      item.status = "pending";
+      item.attempts = 0;
+      item.nextAttemptAt = Date.now();
+      item.updatedAt = Date.now();
+      item.lastError = undefined;
+      item.failureReason = undefined;
+      this.emitEvent("queue:progress", item);
     }
   }
 
